@@ -94,7 +94,38 @@ The DLL is self-contained: static CRT, no VC++ redistributable, imports only `ke
 
 ## Install
 
-Copy into the dedicated server directory (the one containing `srcds.exe`):
+### From a release package (recommended)
+
+Download the zip that matches your Metamod build and extract it into the dedicated server
+directory (the one containing `srcds.exe`):
+
+| archive | Metamod:Source |
+|---|---|
+| `fps1000-0.1.0-plapi16.zip` | 1.12.x (PLAPI 16) |
+| `fps1000-0.1.0-plapi17.zip` | 2.0.0-dev (PLAPI 17, e.g. build 1410) |
+| `fps1000-0.1.0-plapi18.zip` | 2.0.x master (PLAPI 18) |
+
+The archive already contains the `addons` tree, so extracting it at the server root gives you:
+
+```
+addons\fps1000\INSTALL.txt
+addons\fps1000\bin\fps1000.dll
+addons\fps1000\bin\fps1000.2.l4d2.dll
+```
+
+Then append one line to `addons\metamod\metaplugins.ini` and restart the server:
+
+```
+addons/fps1000/bin/fps1000
+```
+
+The archive intentionally does **not** ship `metaplugins.ini`, so an existing plugin list is
+never overwritten.
+
+### Manual layout
+
+Pick the DLL that matches your Metamod build (see the table above) and copy it into the
+dedicated server directory as `fps1000.dll`:
 
 ```
 left4dead2\addons\metamod.vdf                        # official Metamod:Source
@@ -103,8 +134,6 @@ left4dead2\addons\fps1000\bin\fps1000.dll            # this plugin
 left4dead2\addons\fps1000\bin\fps1000.2.l4d2.dll     # same file, compatibility name
 left4dead2\addons\metamod\metaplugins.ini            # add one line: addons/fps1000/bin/fps1000
 ```
-
-Pick the DLL that matches your Metamod build (see the table above) and rename it to `fps1000.dll`.
 
 ## Verify
 
