@@ -1,0 +1,7 @@
+# build output
+/core/target/
+/dist/
+
+# local artifacts
+*.log
+*.pdb

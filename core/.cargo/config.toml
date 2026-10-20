@@ -1,0 +1,6 @@
+[build]
+target = "i686-pc-windows-msvc"
+
+[target.i686-pc-windows-msvc]
+# Link the CRT statically so the plugin does not depend on VCRUNTIME140.dll / ucrtbase.dll.
+rustflags = ["-C", "target-feature=+crt-static"]

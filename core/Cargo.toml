@@ -1,0 +1,39 @@
+[package]
+name = "fps1000_core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Metamod:Source plugin that lifts the L4D2 Windows dedicated server to ~1000 FPS by replacing dedicated.dll's per-frame Sleep(1) with a high-resolution waitable timer"
+license = "MIT"
+repository = "https://github.com/MoRanYue/l4d2-fps1000"
+readme = "../README.md"
+
+[lib]
+# cdylib: `cargo build` produces a loadable fps1000.dll directly (no C++ shim needed).
+name = "fps1000"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[features]
+default = ["plapi17"]
+plapi16 = []
+plapi17 = []
+plapi18 = []
+
+[dependencies]
+# Official windows-rs bindings (latest stable). Only the Win32 subset is enabled so WinRT is not
+# pulled in.
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = false
