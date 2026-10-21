@@ -16,22 +16,30 @@
 //!   transmuted. The import table is parsed only to locate the dedicated.dll IAT slot that is
 //!   about to be rewritten, not to obtain the address of `Sleep`.
 //!
-//! Why 0.5 ms
-//! -----------
-//! `CreateWaitableTimerExW(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)` has an effective floor of
-//! about 1.0 ms. Requesting 1.0 ms is quantized to ~1.5 ms (measured: 636 FPS), while requesting
-//! 0.5 ms lands on ~1.0 ms (measured: 995-1000 FPS).
+//! Why the wait is verified against a deadline
+//! -------------------------------------------
+//! `CreateWaitableTimerExW(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)` is accurate to roughly half a
+//! millisecond, and how a request is rounded depends on the host: on one machine a 0.5 ms request
+//! wakes after 1.0 ms, on another after 0.67 ms. A fixed request is therefore not portable.
+//!
+//! It has to be safe, because the engine floors `host_frametime` at 1 ms (`FUN_1018dbb0` in
+//! engine.dll: `host_frametime = max(dt, 0.001)`) and the simulation advances by `host_frametime`
+//! per host frame. If the loop ever iterates faster than one millisecond per frame, accumulated
+//! simulation time grows faster than wall-clock time and the game runs at more than 1x speed.
+//! So every wait is checked against a `QueryPerformanceCounter` deadline: the stub never returns
+//! before the requested duration has actually elapsed.
 
 mod mm;
 
 use core::ffi::c_void;
 use core::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicUsize, Ordering};
 
 use windows::core::{PCSTR, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::LibraryLoader::GetModuleHandleA;
 use windows::Win32::System::Memory::{VirtualProtect, PAGE_PROTECTION_FLAGS, PAGE_READWRITE};
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{
     CreateWaitableTimerExW, SetWaitableTimer, Sleep, WaitForSingleObject,
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, TIMER_ALL_ACCESS,
@@ -40,10 +48,20 @@ use windows::Win32::System::Threading::{
 /// Requests at or above this many milliseconds are passed straight to the original `Sleep`
 /// (startup uses 40 ms, shutdown uses 200 ms).
 const FALLBACK_MS: u32 = 50;
-/// In 100 ns units: 0.5 ms.
-const DUE_ONE_MS: i64 = 5_000;
-/// In 100 ns units: 1 ms.
-const DUE_PER_MS: i64 = 10_000;
+/// 100 ns ticks per millisecond (the unit `SetWaitableTimer` uses).
+const HNS_PER_MS: i64 = 10_000;
+/// Longest single wait the high-resolution timer can honour accurately, in 100 ns ticks (0.5 ms).
+const MAX_CHUNK: i64 = 5_000;
+/// Slack added to every deadline so the wait is not extended by a last, useless sub-chunk.
+const DEADLINE_MARGIN: i64 = 1_000;
+/// A timer wait shorter than this would overshoot by more than it helps: stop instead
+/// (0.3 ms). The frame's own work makes up the difference.
+const MIN_CHUNK: i64 = 3_000;
+/// Safety net: give up and fall back to `Sleep` after this many timer waits in one call.
+const MAX_CHUNKS: u32 = 64;
+
+/// Cached `QueryPerformanceFrequency` result (0 = not queried yet).
+static QPC_FREQ: AtomicI64 = AtomicI64::new(0);
 
 /// Original value of the dedicated.dll IAT slot before installation (the address of
 /// `kernel32!Sleep`). **Only used to restore the slot on unload.**
@@ -77,22 +95,68 @@ unsafe extern "system" fn sleep_stub(ms: u32) {
             Sleep(ms);
             return;
         };
-
-        // Negative means relative time. Asking for 0.5 ms is what lands on a ~1.0 ms wakeup.
-        let due: i64 = -if ms <= 1 {
-            DUE_ONE_MS
-        } else {
-            i64::from(ms) * DUE_PER_MS
-        };
-
-        // lpDueTime is a pointer: passing the value by stack would freeze the server.
-        if SetWaitableTimer(HANDLE(timer), &raw const due, 0, None, None, false).is_err() {
+        let Some(start) = now_hns() else {
             Sleep(ms);
             return;
-        }
+        };
 
         CALLS.fetch_add(1, Ordering::Relaxed);
-        let _ = WaitForSingleObject(HANDLE(timer), INFINITE);
+        let deadline = start + i64::from(ms) * HNS_PER_MS + DEADLINE_MARGIN;
+
+        for _ in 0..MAX_CHUNKS {
+            let Some(now) = now_hns() else {
+                Sleep(ms);
+                return;
+            };
+            let remaining = deadline - now;
+            if remaining <= MIN_CHUNK {
+                // Close enough: another timer wait would overshoot by more than it adds, and the
+                // frame's own work covers the last fraction of a millisecond.
+                return;
+            }
+
+            // Ask for less than what is left so that the timer's rounding-up cannot overshoot
+            // the deadline by a full quantum; long waits only reserve one chunk for the tail.
+            let ask = if remaining > 2 * MAX_CHUNK {
+                remaining - MAX_CHUNK
+            } else {
+                remaining.min(MAX_CHUNK)
+            };
+
+            // Negative means relative time, and lpDueTime is a pointer: passing the value on the
+            // stack would freeze the server.
+            let due: i64 = -ask;
+            if SetWaitableTimer(HANDLE(timer), &raw const due, 0, None, None, false).is_err() {
+                Sleep(ms);
+                return;
+            }
+            let _ = WaitForSingleObject(HANDLE(timer), INFINITE);
+        }
+
+        // The timer kept waking early (broken or throttled): fall back to the system call.
+        Sleep(ms);
+    }
+}
+
+/// Current time in 100 ns ticks, from `QueryPerformanceCounter` (the same clock the engine uses).
+unsafe fn now_hns() -> Option<i64> {
+    unsafe {
+        let mut freq = QPC_FREQ.load(Ordering::Relaxed);
+        if freq <= 0 {
+            let mut queried = 0i64;
+            if QueryPerformanceFrequency(&raw mut queried).is_err() || queried <= 0 {
+                return None;
+            }
+            QPC_FREQ.store(queried, Ordering::Relaxed);
+            freq = queried;
+        }
+
+        let mut counter = 0i64;
+        if QueryPerformanceCounter(&raw mut counter).is_err() {
+            return None;
+        }
+        // 1 s == 10_000_000 ticks of 100 ns; i128 keeps the multiply from overflowing.
+        Some(((i128::from(counter) * 10_000_000) / i128::from(freq)) as i64)
     }
 }
 

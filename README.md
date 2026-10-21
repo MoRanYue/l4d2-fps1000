@@ -9,9 +9,13 @@ system timer resolution and without busy-waiting.
 - no external injector process; the patch is applied when Metamod loads the plugin and reverted
   when it unloads.
 
-Measured on an i7-14700KF (Win11 26220, empty server, `c1m1_hotel`, tickrate 30): **994.7 FPS**,
+Measured on an i7-14700KF (Win11 26220, empty server, `c1m1_hotel`, tickrate 30): **983 FPS**,
 `host_frametime` 1.00 ms, CPU 2.2 %. On a Xeon E5-2696 v4 (tickrate 100, empty server):
 **927.0 FPS**, CPU 8.4 %.
+
+`host_frametime` is deliberately kept at or above 1 ms: the engine floors it at 1 ms and advances
+the simulation by that value, so a faster loop would make the game run faster than real time. See
+[How the plugin works](#how-the-plugin-works).
 
 ## Why the cap exists
 
@@ -54,11 +58,18 @@ and points it at its own stub:
 |---|---|
 | `0` | return immediately (yield) |
 | `>= 50` | call `kernel32!Sleep` as before (startup uses 40 ms, shutdown 200 ms) |
-| anything else (the main loop's `1`) | lazily create a `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` timer, `SetWaitableTimer(due = 0.5 ms, period = 0)` + `WaitForSingleObject(INFINITE)` |
+| anything else (the main loop's `1`) | wait on a `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` timer until a `QueryPerformanceCounter` deadline has really passed |
 
-Requesting **0.5 ms** instead of 1.0 ms is the whole trick: the high-resolution waitable timer has
-an effective floor of about 1.0 ms, so a 1.0 ms request is quantized to ~1.5 ms (636 FPS), while a
-0.5 ms request lands on ~1.0 ms (~1000 FPS).
+The wait is **deadline-verified**, and that matters more than it sounds: `engine.dll` floors
+`host_frametime` at 1 ms (`host_frametime = max(dt, 0.001)` in `FUN_1018dbb0`) and advances the
+simulation by `host_frametime` per host frame. A loop that iterates faster than once per
+millisecond therefore makes game time run faster than wall-clock time — the server reports more
+than 1000 FPS and the game runs at more than 1x speed.
+
+A fixed request cannot prevent that, because the timer's rounding is machine-dependent: a 0.5 ms
+request wakes after 1.0 ms on one host and after 0.67 ms on another. The stub therefore waits in
+chunks of at most 0.5 ms and returns only once the deadline has elapsed, so the server settles at
+roughly 950–1000 FPS and never runs faster than real time.
 
 The timer is created lazily inside the stub, so a server that never sleeps never pays for it, and
 the plugin never changes any process-wide or system-wide setting.
