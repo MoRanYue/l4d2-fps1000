@@ -1,6 +1,6 @@
-# build.ps1 — 构建 fps1000.dll（纯 Rust cdylib，无 C++ 依赖）
-# 用法：powershell -ExecutionPolicy Bypass -File build.ps1
-# 产物：dist\fps1000.dll（PLAPI 16）、dist\fps1000_pl17.dll、dist\fps1000_pl18.dll
+﻿# build.ps1 - build fps1000.dll (pure Rust cdylib, no C++ dependency)
+# usage: powershell -ExecutionPolicy Bypass -File build.ps1
+# output: dist\fps1000.dll (PLAPI 16), dist\fps1000_pl17.dll, dist\fps1000_pl18.dll
 $ErrorActionPreference = 'Stop'
 
 $root = $PSScriptRoot                 # D:\GITHUB\l4d2-fps\plugin
@@ -10,7 +10,7 @@ $out  = Join-Path $core 'target\i686-pc-windows-msvc\release\fps1000.dll'
 
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 
-# 版本 -> 产物名
+# feature -> artifact name
 $variants = @(
     @{ Feature = 'plapi16'; Name = 'fps1000.dll' },
     @{ Feature = 'plapi17'; Name = 'fps1000_pl17.dll' },

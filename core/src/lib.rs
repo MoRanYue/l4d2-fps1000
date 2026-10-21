@@ -16,18 +16,23 @@
 //!   transmuted. The import table is parsed only to locate the dedicated.dll IAT slot that is
 //!   about to be rewritten, not to obtain the address of `Sleep`.
 //!
-//! Why the wait is verified against a deadline
-//! -------------------------------------------
-//! `CreateWaitableTimerExW(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)` is accurate to roughly half a
-//! millisecond, and how a request is rounded depends on the host: on one machine a 0.5 ms request
-//! wakes after 1.0 ms, on another after 0.67 ms. A fixed request is therefore not portable.
+//! How the per-frame wait is calibrated
+//! ------------------------------------
+//! `CreateWaitableTimerExW(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)` rounds a request up to the
+//! host's timer quantum, and that quantum differs between machines: a 0.5 ms request wakes after
+//! 1.0 ms on one host and after 0.67 ms on another. A fixed request is therefore not portable.
 //!
-//! It has to be safe, because the engine floors `host_frametime` at 1 ms (`FUN_1018dbb0` in
-//! engine.dll: `host_frametime = max(dt, 0.001)`) and the simulation advances by `host_frametime`
-//! per host frame. If the loop ever iterates faster than one millisecond per frame, accumulated
-//! simulation time grows faster than wall-clock time and the game runs at more than 1x speed.
-//! So every wait is checked against a `QueryPerformanceCounter` deadline: the stub never returns
-//! before the requested duration has actually elapsed.
+//! It also has to be *stable*. The engine floors `host_frametime` at 1 ms (`FUN_1018dbb0` in
+//! engine.dll: `host_frametime = max(dt, 0.001)`) and advances the simulation by it, so a period
+//! below 1 ms makes the game run faster than real time, and a period that alternates between two
+//! values makes the tick timeline uneven (snapshots and sound events arrive in bursts).
+//!
+//! The first timer call therefore calibrates: it probes a range of requests and keeps the one
+//! whose three probes land closest to 1 ms without falling below it. Every later call performs a
+//! single wait of exactly that length, so the frame period stays flat. A `QueryPerformanceCounter`
+//! check after each wait catches a grossly early wake-up (below 0.9 ms) and tops it up; ordinary
+//! jitter of a few tens of microseconds is left alone, because topping it up would add a whole
+//! timer quantum and reintroduce the very jitter this is meant to avoid.
 
 mod mm;
 
@@ -50,18 +55,40 @@ use windows::Win32::System::Threading::{
 const FALLBACK_MS: u32 = 50;
 /// 100 ns ticks per millisecond (the unit `SetWaitableTimer` uses).
 const HNS_PER_MS: i64 = 10_000;
-/// Longest single wait the high-resolution timer can honour accurately, in 100 ns ticks (0.5 ms).
+/// A calibrated wait must average at least this (0.98 ms; the frame's own work covers the last
+/// few microseconds) ...
+const ACCEPT_LOW: i64 = 9_800;
+/// ... and at most this (1.12 ms), so the loop stays near 1000 FPS.
+const ACCEPT_HIGH: i64 = 11_200;
+/// Calibration prefers a candidate whose probes spread no more than this (150 us). A busier host
+/// cannot do better; if nothing qualifies, the closest candidate above 0.98 ms is used anyway.
+const STABLE_SPREAD: i64 = 1_500;
+/// A wait that ends earlier than this (0.9 ms) is topped up with a second wait ...
+const CORRECT_BELOW: i64 = 9_000;
+/// ... up to this point (1.02 ms); the frame's own work covers the rest.
+const CORRECT_TO: i64 = 10_200;
+/// One-shot pacing: how many frame periods to average, and the range the trimmed request may
+/// take (kept inside the 1 ms band that every quantum from 0.25 to 1 ms rounds to).
+const PERIOD_WINDOW: usize = 512;
+const MIN_REQ: i64 = 7_000;
+/// Fallback path: longest single wait the timer honours accurately (0.5 ms).
 const MAX_CHUNK: i64 = 5_000;
-/// Slack added to every deadline so the wait is not extended by a last, useless sub-chunk.
+/// Fallback path: slack added to the deadline so the wait is not extended by a useless sub-chunk.
 const DEADLINE_MARGIN: i64 = 1_000;
-/// A timer wait shorter than this would overshoot by more than it helps: stop instead
-/// (0.3 ms). The frame's own work makes up the difference.
+/// Fallback path: a wait shorter than this is not worth another timer round trip (0.3 ms).
 const MIN_CHUNK: i64 = 3_000;
-/// Safety net: give up and fall back to `Sleep` after this many timer waits in one call.
+/// Fallback path: give up and call `Sleep` after this many timer waits in one call.
 const MAX_CHUNKS: u32 = 64;
+/// `REQ_HNS` value meaning "not calibrated yet"; 0 means "calibration failed, use the chunks".
+const REQ_UNSET: i64 = i64::MIN;
 
 /// Cached `QueryPerformanceFrequency` result (0 = not queried yet).
 static QPC_FREQ: AtomicI64 = AtomicI64::new(0);
+/// Calibrated wait length in 100 ns ticks: `REQ_UNSET` before the first timer call, 0 when
+/// calibration found nothing stable (the chunked fallback is used instead).
+static REQ_HNS: AtomicI64 = AtomicI64::new(REQ_UNSET);
+/// Number of calibrated waits that ended early (diagnostics; forces the fallback when large).
+static EARLY: AtomicUsize = AtomicUsize::new(0);
 
 /// Original value of the dedicated.dll IAT slot before installation (the address of
 /// `kernel32!Sleep`). **Only used to restore the slot on unload.**
@@ -72,6 +99,15 @@ static SLOT: AtomicPtr<*mut c_void> = AtomicPtr::new(ptr::null_mut());
 static TIMER: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 /// Number of calls that took the timer path (diagnostics only).
 static CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Entry timestamp of the previous paced call, or 0 when the last call was not a frame sleep.
+static LAST_ENTRY: AtomicI64 = AtomicI64::new(0);
+/// Sum of the frame periods observed since the last adjustment, and how many were summed.
+static PERIOD_SUM: AtomicI64 = AtomicI64::new(0);
+static PERIOD_N: AtomicUsize = AtomicUsize::new(0);
+/// Sum of the measured wait durations, used with `PERIOD_SUM` to derive the per-frame work.
+static WAIT_SUM: AtomicI64 = AtomicI64::new(0);
+/// Set once the one-shot correction has run, so it happens only once.
+static SETTLED: AtomicUsize = AtomicUsize::new(0);
 
 // ---------------------------------------------------------------------------
 // Replacement stub
@@ -95,12 +131,121 @@ unsafe extern "system" fn sleep_stub(ms: u32) {
             Sleep(ms);
             return;
         };
+        if now_hns().is_none() {
+            Sleep(ms);
+            return;
+        }
+
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        pace(ms);
+
+        let mut req = REQ_HNS.load(Ordering::Relaxed);
+        if req == REQ_UNSET {
+            req = calibrate(timer);
+            REQ_HNS.store(req, Ordering::Relaxed);
+        }
+
+        // Calibrated: one flat wait per frame, which is what keeps the tick timeline even.
+        if req > 0 {
+            let Some(start) = now_hns() else {
+                Sleep(ms);
+                return;
+            };
+            if !wait_once(timer, req) {
+                Sleep(ms);
+                return;
+            }
+            if let Some(now) = now_hns() {
+                let elapsed = now - start;
+                WAIT_SUM.fetch_add(elapsed, Ordering::Relaxed);
+                if elapsed < CORRECT_BELOW {
+                    // Woke early (throttling, or a quantum the calibration did not predict):
+                    // top the wait up so the loop never runs faster than 1 ms per frame.
+                    let rest = CORRECT_TO - elapsed;
+                    // Only top up when the remaining time is worth a whole timer quantum:
+                    // a 50 us top-up would still sleep ~0.5 ms and turn a 0.95 ms frame into
+                    // a 1.45 ms one, which is worse than the few microseconds it recovers.
+                    if rest >= 3_000 {
+                        let _ = wait_once(timer, rest);
+                    }
+                    EARLY.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return;
+        }
+
+        chunked_wait(timer, ms);
+    }
+}
+
+/// One-shot pacing correction. Calibration measures how long the *wait* sleeps, but the engine
+/// also spends time working between two calls, so the frame period is longer than the wait. On an
+/// idle local server that work is ~10 us and does not matter; on a full 31-slot server with
+/// SourceMod it is ~100 us, which costs several percent of the FPS.
+///
+/// So after the first `PERIOD_WINDOW` frames this measures the work per frame once and trims the
+/// request by that much. It is deliberately a *one-shot* correction: a continuous controller would
+/// chase the host's timer quantum and can lock onto a two-quantum wait (which is exactly the
+/// 1.5 ms frame period this plugin must avoid).
+unsafe fn pace(ms: u32) {
+    unsafe {
+        if ms > 1 {
+            // Not the frame loop (hibernation and friends): restart the measurement so a long
+            // sleep cannot drag the average.
+            LAST_ENTRY.store(0, Ordering::Relaxed);
+            return;
+        }
+        let Some(entry) = now_hns() else {
+            return;
+        };
+        let prev = LAST_ENTRY.swap(entry, Ordering::Relaxed);
+        if prev == 0 {
+            return;
+        }
+        let period = entry - prev;
+        if !(1_000..=5_000).contains(&period) {
+            return; // a hitch or a loading frame: not representative of the frame loop
+        }
+        PERIOD_SUM.fetch_add(period, Ordering::Relaxed);
+        let n = PERIOD_N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n < PERIOD_WINDOW || SETTLED.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        let sum = PERIOD_SUM.swap(0, Ordering::Relaxed);
+        let waited = WAIT_SUM.swap(0, Ordering::Relaxed);
+        PERIOD_N.store(0, Ordering::Relaxed);
+        let req = REQ_HNS.load(Ordering::Relaxed);
+        if req <= 0 {
+            return;
+        }
+        SETTLED.store(1, Ordering::Relaxed);
+        let avg = sum / n as i64;
+        let wait_avg = waited / n as i64;
+        let work = (avg - wait_avg).clamp(0, 5_000);
+        if work < 300 {
+            return; // the frame work is negligible, the calibrated wait is already right
+        }
+        let trimmed = (HNS_PER_MS - work).clamp(MIN_REQ, HNS_PER_MS);
+        REQ_HNS.store(trimmed, Ordering::Relaxed);
+        log(&format!(
+            "timer: frame work ~{}us, request trimmed {}us -> {}us (period was {}.{:03}ms)",
+            work / 10,
+            req / 10,
+            trimmed / 10,
+            avg / HNS_PER_MS,
+            (avg % HNS_PER_MS) / 10,
+        ));
+    }
+}
+
+/// Fallback: wait in chunks of at most 0.5 ms until a `QueryPerformanceCounter` deadline has
+/// really passed. Settles slower than a calibrated wait, but is always safe.
+unsafe fn chunked_wait(timer: *mut c_void, ms: u32) {
+    unsafe {
         let Some(start) = now_hns() else {
             Sleep(ms);
             return;
         };
-
-        CALLS.fetch_add(1, Ordering::Relaxed);
         let deadline = start + i64::from(ms) * HNS_PER_MS + DEADLINE_MARGIN;
 
         for _ in 0..MAX_CHUNKS {
@@ -123,18 +268,138 @@ unsafe extern "system" fn sleep_stub(ms: u32) {
                 remaining.min(MAX_CHUNK)
             };
 
-            // Negative means relative time, and lpDueTime is a pointer: passing the value on the
-            // stack would freeze the server.
-            let due: i64 = -ask;
-            if SetWaitableTimer(HANDLE(timer), &raw const due, 0, None, None, false).is_err() {
+            if !wait_once(timer, ask) {
                 Sleep(ms);
                 return;
             }
-            let _ = WaitForSingleObject(HANDLE(timer), INFINITE);
         }
 
         // The timer kept waking early (broken or throttled): fall back to the system call.
         Sleep(ms);
+    }
+}
+
+/// Arm the timer for `hns` of 100 ns ticks and block until it fires.
+unsafe fn wait_once(timer: *mut c_void, hns: i64) -> bool {
+    unsafe {
+        // Negative means relative time, and lpDueTime is a pointer: passing the value on the
+        // stack would freeze the server.
+        let due: i64 = -hns;
+        if SetWaitableTimer(HANDLE(timer), &raw const due, 0, None, None, false).is_err() {
+            return false;
+        }
+        let _ = WaitForSingleObject(HANDLE(timer), INFINITE);
+        true
+    }
+}
+
+/// Measure how long one wait of `hns` really takes, in 100 ns ticks.
+unsafe fn probe(timer: *mut c_void, hns: i64) -> Option<i64> {
+    unsafe {
+        let start = now_hns()?;
+        if !wait_once(timer, hns) {
+            return None;
+        }
+        Some(now_hns()? - start)
+    }
+}
+
+/// Find the request that actually waits about one millisecond on this host.
+///
+/// Returns the calibrated length in 100 ns ticks, or 0 when no candidate is stable enough (the
+/// caller then uses [`chunked_wait`]).
+unsafe fn calibrate(timer: *mut c_void) -> i64 {
+    /// Every request worth probing: the natural 1 ms first, then shorter ones (which round up to
+    /// the host's quantum) and a few longer ones for hosts with a coarse timer.
+    const CANDIDATES: [i64; 11] = [
+        10_000, 9_000, 8_000, 7_000, 6_000, 5_000, 11_000, 12_000, 13_000, 15_000, 20_000,
+    ];
+    /// Probes per candidate. Enough to see the spread, few enough to finish in ~50 ms.
+    const PROBES: i64 = 4;
+
+    unsafe {
+        let mut best = 0i64;
+        let mut best_err = i64::MAX;
+        let mut best_mean = 0i64;
+        let mut best_spread = i64::MAX;
+
+        // Best effort for hosts whose timer is too jittery for the strict check below: take the
+        // request that lands closest to 1 ms as long as it does not come in under it.
+        let mut any = 0i64;
+        let mut any_err = i64::MAX;
+        let mut any_mean = 0i64;
+        let mut any_spread = 0i64;
+        let mut table = String::new();
+
+        for cand in CANDIDATES {
+            let mut lo = i64::MAX;
+            let mut hi = i64::MIN;
+            let mut sum = 0i64;
+            let mut ok = true;
+            for _ in 0..PROBES {
+                match probe(timer, cand) {
+                    Some(t) => {
+                        lo = lo.min(t);
+                        hi = hi.max(t);
+                        sum += t;
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let mean = sum / PROBES;
+            let spread = hi - lo;
+            table.push_str(&format!(" {}:{}", cand / 10, mean / 10));
+
+            if mean < ACCEPT_LOW {
+                continue;
+            }
+            // Prefer the candidate that lands closest to exactly one millisecond.
+            let err = (mean - HNS_PER_MS).abs();
+            if mean <= ACCEPT_HIGH && spread <= STABLE_SPREAD && err < best_err {
+                best_err = err;
+                best = cand;
+                best_mean = mean;
+                best_spread = spread;
+            }
+            if err < any_err {
+                any_err = err;
+                any = cand;
+                any_mean = mean;
+                any_spread = spread;
+            }
+        }
+
+        if best != 0 {
+            log(&format!(
+                "timer: request={}us wakes after {}.{:03}ms (spread {}us)",
+                best / 10,
+                best_mean / HNS_PER_MS,
+                (best_mean % HNS_PER_MS) / 10,
+                best_spread / 10,
+            ));
+            best
+        } else if any != 0 {
+            log(&format!(
+                "timer: request={}us wakes after {}.{:03}ms (spread {}us, jittery)",
+                any / 10,
+                any_mean / HNS_PER_MS,
+                (any_mean % HNS_PER_MS) / 10,
+                any_spread / 10,
+            ));
+            any
+        } else {
+            log(&format!(
+                "timer: no request reached 0.98ms (request:mean us ={}), using the chunked wait",
+                table
+            ));
+            0
+        }
     }
 }
 
@@ -392,13 +657,21 @@ pub unsafe extern "C" fn fps1000_info(buf: *mut u8, cap: usize) -> usize {
     }
 
     let slot = SLOT.load(Ordering::Acquire);
+    let req = REQ_HNS.load(Ordering::Relaxed);
+    let req_text = if req == REQ_UNSET {
+        "uncalibrated".to_string()
+    } else {
+        format!("{}.{:03}ms", req / HNS_PER_MS, (req % HNS_PER_MS) / 10)
+    };
     let text = format!(
-        "fps1000_core {}\nwindows-crate=0.62.2 strict-provenance=on\ninstalled={}\niat_sleep=0x{:08X}\nsaved_sleep=0x{:08X}\ntimer={}\ncalls={}\n",
+        "fps1000_core {}\nwindows-crate=0.62.2 strict-provenance=on\ninstalled={}\niat_sleep=0x{:08X}\nsaved_sleep=0x{:08X}\ntimer={}\nwait={}\nearly={}\ncalls={}\n",
         env!("CARGO_PKG_VERSION"),
         if slot.is_null() { "no" } else { "yes" },
         slot as usize,
         SAVED_SLEEP.load(Ordering::Acquire) as usize,
         if TIMER.load(Ordering::Acquire).is_null() { "lazy" } else { "ready" },
+        req_text,
+        EARLY.load(Ordering::Relaxed),
         CALLS.load(Ordering::Relaxed),
     );
 

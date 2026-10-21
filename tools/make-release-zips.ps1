@@ -47,10 +47,11 @@ fps1000 $version - Metamod:Source plugin for the Left 4 Dead 2 Windows dedicated
    An empty server hibernates (sv_hibernate_when_empty 1) and stays near
    50 FPS until a player joins; set it to 0 to measure on an idle server.
 
-The server settles at roughly 950-1000 FPS. It deliberately never goes
-faster: the engine floors host_frametime at 1 ms and advances the
-simulation by that value, so a faster loop would make the game run faster
-than real time.
+The server settles at roughly 850-1000 FPS, depending on how closely the
+host's high-resolution timer can land on 1 ms (the plugin logs the value it
+picked). It deliberately never goes faster: the engine floors host_frametime
+at 1 ms and advances the simulation by that value, so a faster loop would
+make the game run faster than real time.
 
 To uninstall, remove the line from metaplugins.ini and delete
 addons\fps1000.
