@@ -1,6 +1,6 @@
-﻿[package]
+[package]
 name = "fps1000_core"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 rust-version = "1.85"
 description = "Metamod:Source plugin that lifts the L4D2 Windows dedicated server to ~1000 FPS by replacing dedicated.dll's per-frame Sleep(1) with a high-resolution waitable timer"

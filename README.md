@@ -11,11 +11,11 @@ system timer resolution and without busy-waiting.
 - no external injector process; the patch is applied when Metamod loads the plugin and reverted
   when it unloads.
 
-Measured on an i7-14700KF (Win11 26220, empty server, `c1m1_hotel`, tickrate 30): **966 FPS**,
-`host_frametime` 1.02 ms, CPU 20 %, and the frame period never drops below 1 ms (min 1014 µs). On a
-Xeon E5-2696 v4 (tickrate 100, 31-slot server with players): **859 FPS** with 0.1.2, CPU 9.0 % —
-that host's high-resolution timer wakes after ~1.06 ms and every frame also carries ~0.1 ms of
-engine work, which is where the gap comes from.
+Measured on an i7-14700KF (Win11 26220, empty server, `c1m1_hotel`, tickrate 30): **963 FPS**,
+`host_frametime` 1.04 ms, CPU 20 %, and the frame period never drops below 1 ms. On a Xeon E5-2696 v4
+(tickrate 100, 31 slots): **865 FPS**, CPU 16 %, simulation rate 1.00 — that host's timer has a hard
+~1.05 ms floor, so asking for a shorter wait cannot buy a shorter frame; the plugin detects that and
+stops trimming instead of sliding towards a request the timer ignores.
 
 `host_frametime` is deliberately kept at or above 1 ms: the engine floors it at 1 ms and advances
 the simulation by that value, so a faster loop would make the game run faster than real time. See
@@ -91,6 +91,12 @@ it never chases a two-quantum wait (a 1.5 ms frame), which is what the plugin mu
 
 The chosen value is written to `fps1000.log`, e.g. `timer: request=650us wakes after 1.004ms
 (spread 4us)`, together with `spin_avg` and every re-calibration.
+
+Hosts whose timer has a floor under the wait are handled explicitly: every step down is a probe — the
+wait is measured again at the new level, and if it did not shrink, the request goes back to the level
+that worked and the search stops for good (`timer: 550us and 700us both wake after 1036us (timer
+floor), keeping 550us`). Without that check the request keeps sliding towards the minimum while the
+timer ignores it, and the spin pays for a step that bought nothing.
 
 The timer is created lazily inside the stub, so a server that never sleeps never pays for it, and
 the plugin never changes any process-wide or system-wide setting.
@@ -199,6 +205,10 @@ than 1 ms, so the counter only counts executed frames and reads a misleading ~67
 
 ## Changelog
 
+- **0.1.4** — the runtime trim now probes each step: if a shorter request does not make the timer
+  wake earlier, the request returns to the level that worked and the search stops. On a host whose
+  timer has a hard ~1.05 ms floor this removed the pointless stepping (CPU 26 % → 16 % at the same
+  865 FPS).
 - **0.1.3** — the stub now enforces a hard 1 ms floor: after the wait it spins the remainder, so a
   host whose high-resolution timer always wakes early can no longer produce a sub-millisecond frame
   (the failure mode behind "sv above 1000" and kill announcements arriving before the shot). The

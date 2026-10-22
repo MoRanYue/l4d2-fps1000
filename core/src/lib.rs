@@ -40,7 +40,7 @@ mod diag;
 
 use core::ffi::c_void;
 use core::ptr;
-use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicUsize, Ordering};
 
 use windows::core::{PCSTR, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -141,6 +141,13 @@ static SETTLED: AtomicUsize = AtomicUsize::new(0);
 static WAIT_EMA: AtomicI64 = AtomicI64::new(0);
 /// Calibrated waits since the last request adjustment.
 static ADJUST_N: AtomicUsize = AtomicUsize::new(0);
+/// Request level a downward probe started from (0 when no probe is running).
+static PROBE_FROM: AtomicI64 = AtomicI64::new(0);
+/// Wait average measured at [`PROBE_FROM`], used to tell whether a shorter request helped.
+static PROBE_WAIT: AtomicI64 = AtomicI64::new(0);
+/// Set once a shorter request failed to shorten the wait: the host's timer has a floor there, and
+/// stepping further down only burns CPU on the spin without moving the frame period.
+static FLOOR_LOCK: AtomicBool = AtomicBool::new(false);
 /// Set once a request step overshot the frame, which ends the upward search.
 /// Frames since the last request overshoot: stepping up again is allowed only after a while,
 /// so one bad step does not freeze the request at a needlessly low level.
@@ -326,6 +333,11 @@ unsafe fn pace(ms: u32) {
 /// with a moving average and the request is stepped until the wait itself lands just under the
 /// 1 ms target. The spin keeps the frame period correct at every step, so a bad guess costs CPU,
 /// not pacing.
+///
+/// Some hosts have a hard floor under the wait (a 400 us request still wakes after 1.05 ms, because
+/// the timer only ever rounds up to its own quantum). There, stepping down changes nothing but the
+/// spin length, so a step is always probed: the wait is measured again at the new level, and if it
+/// did not shrink the request goes back up and [`FLOOR_LOCK`] stops the search for good.
 fn adapt_request(elapsed: i64, rest: i64) {
     /// Step per adjustment (0.05 ms), the share of the frame the spin should cover, and how far
     /// the measured wait may sit from that point.
@@ -360,12 +372,47 @@ fn adapt_request(elapsed: i64, rest: i64) {
     if req <= 0 {
         return;
     }
+
+    // A probe is running when `PROBE_FROM` is set: the request was stepped down from that level,
+    // and the wait average has since been collected at the new one. If the wait did not get any
+    // shorter, the host's timer has a floor there — the step bought nothing but spin time — so go
+    // back up and stop stepping down for the rest of the process.
+    let probe_from = PROBE_FROM.load(Ordering::Relaxed);
+    if probe_from != 0 {
+        let probe_wait = PROBE_WAIT.load(Ordering::Relaxed);
+        if ema < probe_wait - STEP / 2 {
+            // The lower level does wake earlier; keep it and let the controller probe again.
+            PROBE_FROM.store(0, Ordering::Relaxed);
+        } else {
+            REQ_HNS.store(probe_from, Ordering::Relaxed);
+            PROBE_FROM.store(0, Ordering::Relaxed);
+            FLOOR_LOCK.store(true, Ordering::Relaxed);
+            WAIT_EMA.store(0, Ordering::Relaxed);
+            REST_EMA.store(i64::MIN, Ordering::Relaxed);
+            log(&format!(
+                "timer: {}us and {}us both wake after {}us (timer floor), keeping {}us",
+                probe_from / 10,
+                req / 10,
+                ema / 10,
+                probe_from / 10,
+            ));
+            return;
+        }
+    }
+
     // `rest_ema` is what is left of the frame after the wait: below zero the timer overshot the
     // deadline (the frame is late and the simulation falls behind), above the spin budget it
     // stopped a quantum short (the spin pays for it, and the level below would be worse). Keep it
     // inside the band; a bad guess costs CPU, not pacing.
     // The spin fills the rest, so the period stays at the target at every level.
-    let next = if rest_ema < -LATE {
+    let next = if FLOOR_LOCK.load(Ordering::Relaxed) {
+        req
+    } else if rest_ema < -LATE {
+        // Remember where this step started so the next window can tell whether it helped.
+        if PROBE_FROM.load(Ordering::Relaxed) == 0 {
+            PROBE_FROM.store(req, Ordering::Relaxed);
+            PROBE_WAIT.store(ema, Ordering::Relaxed);
+        }
         (req - STEP).max(3_000)
     } else if rest_ema > SPIN_TARGET {
         (req + STEP).min(HNS_PER_MS)
