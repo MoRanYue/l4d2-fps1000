@@ -5,3 +5,4 @@
 # local artifacts
 *.log
 *.pdb
+dist-diag/

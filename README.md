@@ -4,15 +4,18 @@ A tiny [Metamod:Source](https://www.metamodsource.net/) plugin (pure Rust, one D
 Left 4 Dead 2 dedicated server on Windows from **64 / 512 FPS** to **~1000 FPS**, without touching
 system timer resolution and without busy-waiting.
 
-- no `timeBeginPeriod`, no `NtSetTimerResolution`, no power-throttling tweaks;
-- no spinning — CPU usage stays around 2–3 % on a modern desktop CPU;
+- no `timeBeginPeriod`, no `NtSetTimerResolution`, no power-throttling tweaks, no BCD changes;
+- the wait is a high-resolution waitable timer; only the last fraction of a millisecond is spun, and
+  only when the host's timer cannot land on 1 ms (measured 3 % CPU when it can, ~20 % when the
+  remainder has to be spun out);
 - no external injector process; the patch is applied when Metamod loads the plugin and reverted
   when it unloads.
 
-Measured on an i7-14700KF (Win11 26220, empty server, `c1m1_hotel`, tickrate 30): **990 FPS**,
-`host_frametime` 1.01 ms, CPU 2.2 %. On a Xeon E5-2696 v4 (tickrate 100, 31-slot server with
-players): **859 FPS**, CPU 9.0 % — that host's high-resolution timer wakes after ~1.06 ms and every
-frame also carries ~0.1 ms of engine work, which is where the gap comes from.
+Measured on an i7-14700KF (Win11 26220, empty server, `c1m1_hotel`, tickrate 30): **966 FPS**,
+`host_frametime` 1.02 ms, CPU 20 %, and the frame period never drops below 1 ms (min 1014 µs). On a
+Xeon E5-2696 v4 (tickrate 100, 31-slot server with players): **859 FPS** with 0.1.2, CPU 9.0 % —
+that host's high-resolution timer wakes after ~1.06 ms and every frame also carries ~0.1 ms of
+engine work, which is where the gap comes from.
 
 `host_frametime` is deliberately kept at or above 1 ms: the engine floors it at 1 ms and advances
 the simulation by that value, so a faster loop would make the game run faster than real time. See
@@ -73,21 +76,21 @@ machine-dependent: a 0.5 ms request wakes after 1.0 ms on one host and after 0.6
 The plugin therefore **calibrates once**, on the first timer call: it probes a range of requests
 (1.0 ms, 0.9, 0.8, … 0.5, then 1.1 … 2.0 ms), four probes each, and keeps the stable one
 (spread ≤ 150 µs) whose mean lands closest to 1 ms. Every later call performs exactly one wait of
-that length, so the frame period stays flat. A `QueryPerformanceCounter` check after each wait
-catches an early wake-up (below 0.9 ms) and tops it up, but only when the remaining time is worth a
-whole quantum — a 50 µs top-up would still sleep ~0.5 ms and turn a 0.95 ms frame into a 1.45 ms
-one.
+that length, so the frame period stays flat.
 
-The chosen value is written to `fps1000.log`, e.g. `timer: request=700us wakes after 1.003ms
-(spread 4us)`. If nothing lands in the 0.98–1.12 ms window, the stub falls back to a chunked wait
-that never ends before the 1 ms deadline (slower to settle, but always safe).
+On top of that the stub enforces a **hard floor**: after the wait it reads `QueryPerformanceCounter`
+and, if the frame has not reached 1 ms yet, spins the remainder (typically a few tens of
+microseconds). A host whose timer always wakes early can therefore never produce a sub-millisecond
+frame — which is exactly the failure mode that makes the simulation run fast and reorders events.
 
-After calibration the plugin measures, over its first 512 frames, the *period* as well as the wait.
-If the engine's own work between two waits is significant (a full 31-slot server spends ~0.1 ms per
-frame), the request is trimmed by that amount **once**, so the period lands back on 1 ms. This is
-deliberately a one-shot correction: a continuous controller would chase the host's timer quantum and
-can lock onto a two-quantum wait (a 1.5 ms frame), which is exactly what this plugin must avoid. The
-correction is logged as `timer: frame work ~100us, request trimmed 1000us -> 900us`.
+The frame's own work (the engine's tick, ~0.1 ms on a full server) is measured directly, as the gap
+between the end of one wait and the start of the next, and the deadline is moved back by that much
+so the period still lands on 1 ms. A slow controller then nudges the request in 50 µs steps until
+the wait itself sits just under the deadline; it only steps up once the wait comes back early, and
+it never chases a two-quantum wait (a 1.5 ms frame), which is what the plugin must avoid.
+
+The chosen value is written to `fps1000.log`, e.g. `timer: request=650us wakes after 1.004ms
+(spread 4us)`, together with `spin_avg` and every re-calibration.
 
 The timer is created lazily inside the stub, so a server that never sleeps never pays for it, and
 the plugin never changes any process-wide or system-wide setting.
@@ -196,6 +199,12 @@ than 1 ms, so the counter only counts executed frames and reads a misleading ~67
 
 ## Changelog
 
+- **0.1.3** — the stub now enforces a hard 1 ms floor: after the wait it spins the remainder, so a
+  host whose high-resolution timer always wakes early can no longer produce a sub-millisecond frame
+  (the failure mode behind "sv above 1000" and kill announcements arriving before the shot). The
+  frame's own work is now measured directly instead of being inferred from the period, and the
+  request is steered by a slow 50 µs controller. Costs ~2 % of the peak FPS (985 → 966 here) in
+  exchange for a period that never drops below 1 ms.
 - **0.1.2** — the per-frame wait is now a single flat wait whose length is calibrated once at
   startup, instead of a chunked wait with a deadline. The chunked wait was correct on average but
   oscillated between one and two waits on hosts whose timer quantum does not divide 0.5 ms, which

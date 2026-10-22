@@ -1,6 +1,6 @@
-[package]
+﻿[package]
 name = "fps1000_core"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.85"
 description = "Metamod:Source plugin that lifts the L4D2 Windows dedicated server to ~1000 FPS by replacing dedicated.dll's per-frame Sleep(1) with a high-resolution waitable timer"
@@ -19,6 +19,8 @@ default = ["plapi17"]
 plapi16 = []
 plapi17 = []
 plapi18 = []
+# Temporary field-test instrumentation: one detailed line per second in fps1000.log.
+diag = []
 
 [dependencies]
 # Official windows-rs bindings (latest stable). Only the Win32 subset is enabled so WinRT is not
@@ -38,3 +40,4 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = false
+
